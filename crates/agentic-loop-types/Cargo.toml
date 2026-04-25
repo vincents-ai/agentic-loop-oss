@@ -1,0 +1,15 @@
+[package]
+name = "agentic-loop-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Pure types for agentic-loop (no trait definitions)"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+anyhow = { workspace = true }
+cron = "0.16.0"

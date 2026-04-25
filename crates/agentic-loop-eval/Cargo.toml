@@ -1,0 +1,19 @@
+[package]
+name = "agentic-loop-eval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Evaluation trait definitions and heuristic evaluator"
+
+[dependencies]
+agentic-loop-types = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tracing = "0.1"
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }

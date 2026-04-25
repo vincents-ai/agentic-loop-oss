@@ -1,0 +1,81 @@
+[workspace.package]
+name = "agentic-loop-oss"
+version = "0.1.0"
+edition = "2021"
+authors = ["vincents-ai"]
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/vincents-ai/agentic-loop-oss"
+rust-version = "1.95"
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/agentic-loop-types",
+    "crates/agentic-loop-storage",
+    "crates/agentic-loop-tools",
+    "crates/agentic-loop-workflow",
+    "crates/agentic-loop-eval",
+    "crates/agentic-loop-llm",
+    "crates/agentic-loop-storage-gitrefs",
+    "crates/agentic-loop-tools-core",
+    "crates/agentic-loop-wasm",
+]
+
+[workspace.dependencies]
+# ── Core ──
+anyhow = "1.0"
+thiserror = "2.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "process"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+async-trait = "0.1"
+
+# ── Utilities ──
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dirs = "6"
+toml = "1"
+regex = "1"
+walkdir = "2"
+
+# ── Git ──
+gix = { version = "0.81", default-features = false, features = ["max-performance-safe", "sha1"] }
+gix-actor = "0.40.0"
+git2 = "0.20"
+
+# ── WASM ──
+wasmtime = "44"
+wasmtime-wasi = "44"
+wit-bindgen = "0.42"
+
+# ── External path dependencies ──
+engram = { path = "/home/shift/code/agentic-git/engram" }
+vincents-llm = { path = "/home/shift/code/vincents-ai/llm" }
+
+# ── Internal workspace crates ──
+agentic-loop-types = { path = "crates/agentic-loop-types" }
+agentic-loop-storage = { path = "crates/agentic-loop-storage" }
+agentic-loop-tools = { path = "crates/agentic-loop-tools" }
+agentic-loop-workflow = { path = "crates/agentic-loop-workflow" }
+agentic-loop-eval = { path = "crates/agentic-loop-eval" }
+agentic-loop-llm = { path = "crates/agentic-loop-llm" }
+agentic-loop-storage-gitrefs = { path = "crates/agentic-loop-storage-gitrefs" }
+agentic-loop-tools-core = { path = "crates/agentic-loop-tools-core" }
+agentic-loop-wasm = { path = "crates/agentic-loop-wasm" }
+agentic-loop-bin = { path = "crates/agentic-loop-bin" }
+
+# ── Dev dependencies ──
+tempfile = "3"
+tokio-test = "0.4"
+pretty_assertions = "1"
+insta = { version = "1", features = ["yaml", "json", "filters"] }
+rstest = "0.23"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

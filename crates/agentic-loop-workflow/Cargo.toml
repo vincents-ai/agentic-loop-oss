@@ -1,0 +1,27 @@
+[package]
+name = "agentic-loop-workflow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Workflow engine traits and custom .workflow parser"
+
+[dependencies]
+agentic-loop-types = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = "0.1"
+thiserror.workspace = true
+
+[dev-dependencies]
+criterion = "0.8.2"
+proptest = "1.11.0"
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[[bench]]
+name = "bench_parser"
+harness = false
