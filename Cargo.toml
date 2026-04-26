@@ -19,6 +19,7 @@ members = [
     "crates/agentic-loop-storage-gitrefs",
     "crates/agentic-loop-tools-core",
     "crates/agentic-loop-wasm",
+    "crates/agentic-loop-bin",
 ]
 
 [workspace.dependencies]

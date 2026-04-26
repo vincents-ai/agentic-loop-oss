@@ -12,6 +12,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentic-loop-bin"
+version = "0.1.0"
+dependencies = [
+ "agentic-loop-eval",
+ "agentic-loop-llm",
+ "agentic-loop-storage",
+ "agentic-loop-storage-gitrefs",
+ "agentic-loop-tools",
+ "agentic-loop-tools-core",
+ "agentic-loop-types",
+ "agentic-loop-workflow",
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "agentic-loop-eval"
 version = "0.1.0"
 dependencies = [

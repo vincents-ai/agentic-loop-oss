@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "agentic-loop binary — wires traits to implementations"
+description = "agentic-loop binary — wires traits to implementations (OSS)"
 
 [[bin]]
 name = "agentic-loop"
@@ -19,21 +19,10 @@ agentic-loop-storage-gitrefs = { workspace = true }
 agentic-loop-workflow = { workspace = true }
 agentic-loop-eval = { workspace = true }
 agentic-loop-llm = { workspace = true }
-agentic-core = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-chrono = { workspace = true }
-dirs = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
-tracing-opentelemetry = "0.32.1"
-opentelemetry = "0.31.0"
-opentelemetry_sdk = "0.31.0"
-opentelemetry-otlp = { version = "0.31.1", features = ["grpc-tonic"] }
-clap = { version = "4.6.1", features = ["derive", "env"] }
-cron = "0.16.0"
-gix.workspace = true
-rustyline = "18.0.0"
