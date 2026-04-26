@@ -1,4 +1,8 @@
 //! Model pool — cross-provider model selection with 3-level health tracking.
+//!
+//! Each entry holds its own `Arc<dyn LLMProvider>` — no wrapper type needed.
+//! The pool rotates between entries based on health scores, provider cooldown,
+//! and the configured rotation strategy.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,8 +15,8 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 use vincents_llm::{
     ChatCompletionRequest, ChatMessage, FunctionDefinition, LLMError,
+    LLMProvider,
 };
-use vincents_llm_wrapper::LlmWrapper;
 
 use crate::executor::{
     LlmExecutorTrait, LlmStepResult, ToolDefinition, ToolResult,
@@ -52,11 +56,11 @@ impl std::str::FromStr for RotationStrategy {
     }
 }
 
-/// Pool model entry.
+/// Pool model entry — holds a trait object, not a concrete wrapper.
 pub struct PoolModelEntry {
-    pub provider: String,
+    pub provider_name: String,
     pub model: String,
-    pub wrapper: Arc<LlmWrapper>,
+    pub provider: Arc<dyn LLMProvider>,
     pub context_length: u32,
     pub capabilities: Vec<ModelCapability>,
     pub cost_tier: ModelCostTier,
@@ -64,7 +68,7 @@ pub struct PoolModelEntry {
 
 impl PoolModelEntry {
     pub fn key(&self) -> String {
-        format!("{}/{}", self.provider, self.model)
+        format!("{}/{}", self.provider_name, self.model)
     }
 
     pub fn matches_type(&self, mt: &ModelType) -> bool {
@@ -72,10 +76,10 @@ impl PoolModelEntry {
             ModelType::Auto => true,
             ModelType::Free => self.cost_tier == ModelCostTier::Free,
             ModelType::Coding => self.capabilities.contains(&ModelCapability::Coding) || self.cost_tier == ModelCostTier::Free,
-            ModelType::Fast => true, // Fast just means prefer cheap/quick, no strict filter
+            ModelType::Fast => true,
             ModelType::Reasoning => self.capabilities.contains(&ModelCapability::Reasoning),
             ModelType::Vision => self.capabilities.contains(&ModelCapability::Vision),
-            ModelType::Smart => true, // Smart means any model, ranked by quality
+            ModelType::Smart => true,
         }
     }
 }
@@ -231,7 +235,7 @@ impl ModelPool {
         let mut provider_counts: HashMap<String, usize> = HashMap::new();
         for entry in &entries {
             model_health.insert(entry.key(), ModelHealth::new());
-            *provider_counts.entry(entry.provider.clone()).or_insert(0) += 1;
+            *provider_counts.entry(entry.provider_name.clone()).or_insert(0) += 1;
         }
         let provider_health: HashMap<String, ProviderHealth> = provider_counts
             .into_iter().map(|(p, c)| (p, ProviderHealth::new(c))).collect();
@@ -265,11 +269,11 @@ impl ModelPool {
 
         let mut candidates = Vec::new();
         for (i, entry) in self.entries.iter().enumerate() {
-            if !provider_ok(&entry.provider) { continue; }
+            if !provider_ok(&entry.provider_name) { continue; }
             if !model_ok(&entry.key()) { continue; }
             if !type_ok(entry) { continue; }
             let h = model_health.get(&entry.key()).unwrap();
-            candidates.push((i, h.score(), entry.provider.clone(), h.last_used));
+            candidates.push((i, h.score(), entry.provider_name.clone(), h.last_used));
         }
 
         if candidates.is_empty() {
@@ -308,7 +312,7 @@ impl ModelPool {
     pub async fn mark_success(&self, index: usize) {
         let entry = &self.entries[index];
         let key = entry.key();
-        let provider = entry.provider.clone();
+        let provider = entry.provider_name.clone();
         let mut model_health = self.model_health.write().await;
         if let Some(h) = model_health.get_mut(&key) {
             h.success_count += 1;
@@ -325,7 +329,7 @@ impl ModelPool {
     pub async fn mark_failure(&self, index: usize, error: &LLMError) -> bool {
         let entry = &self.entries[index];
         let key = entry.key();
-        let provider = entry.provider.clone();
+        let provider = entry.provider_name.clone();
         let scope = classify_error(error);
         let now = Instant::now();
         let mut escalated = false;
@@ -366,7 +370,7 @@ impl ModelPool {
         if !escalated {
             let model_health = self.model_health.read().await;
             let pf: u32 = self.entries.iter()
-                .filter(|e| e.provider == provider)
+                .filter(|e| e.provider_name == provider)
                 .filter_map(|e| model_health.get(&e.key()).map(|h| h.consecutive_failures)).sum();
             if pf >= CooldownDefaults::PROVIDER_ESCALATION_THRESHOLD {
                 drop(model_health);
@@ -389,7 +393,7 @@ impl ModelPool {
         self.entries.iter().map(|e| {
             let h = model_health.get(&e.key()).unwrap();
             ModelHealthReport {
-                provider: e.provider.clone(),
+                provider: e.provider_name.clone(),
                 model: e.model.clone(),
                 success_count: h.success_count,
                 failure_count: h.failure_count,
@@ -414,92 +418,122 @@ impl ModelPool {
     }
 }
 
+/// Execute a request against a pool entry's provider, with timeout.
+async fn execute_with_entry(
+    entry: &PoolModelEntry,
+    request: ChatCompletionRequest,
+    tools: &[ToolDefinition],
+    timeout: Duration,
+) -> Result<vincents_llm::ChatCompletionResponse, LLMError> {
+    if !tools.is_empty() {
+        let functions: Vec<FunctionDefinition> = tools.iter().map(|t| FunctionDefinition {
+            name: t.name.clone(),
+            description: Some(t.description.clone()),
+            parameters: Some(t.parameters.clone()),
+        }).collect();
+        tokio::time::timeout(timeout, entry.provider.chat_completion_with_functions(request, functions))
+            .await
+            .map_err(|_| LLMError::TimeoutError {
+                timeout_secs: timeout.as_secs(),
+                message: Some(format!("Model {} timed out", entry.model)),
+            })?
+    } else {
+        tokio::time::timeout(timeout, entry.provider.chat_completion(request))
+            .await
+            .map_err(|_| LLMError::TimeoutError {
+                timeout_secs: timeout.as_secs(),
+                message: Some(format!("Model {} timed out", entry.model)),
+            })?
+    }
+}
+
+/// Parse an LLM response into a step result.
+fn parse_pool_response(response: vincents_llm::ChatCompletionResponse) -> LlmStepResult {
+    let tokens_used = response.usage.as_ref().map(|u| u.total_tokens).unwrap_or(0);
+    let choice = response.choices.into_iter().next();
+    let (text, finish, tool_calls) = match choice {
+        Some(c) => {
+            let txt = match &c.message {
+                ChatMessage::Assistant { content, .. } => content.clone(),
+                _ => None,
+            };
+            let calls = crate::executor::LlmExecutor::extract_tool_calls(&c.message);
+            (txt, c.finish_reason.clone(), calls)
+        }
+        None => (None, None, vec![]),
+    };
+    LlmStepResult {
+        text,
+        tool_calls,
+        tokens_used,
+        estimated_cost: 0.0,
+        finish_reason: finish,
+    }
+}
+
 #[async_trait::async_trait]
 impl LlmExecutorTrait for ModelPool {
     async fn execute_step(&self, system_prompt: &str, user_prompt: &str, tools: &[ToolDefinition], max_tokens: u32) -> Result<LlmStepResult> {
-        let mut attempts = 0;
         let max_attempts = self.entries.len().max(1);
-        let per_model_timeout = std::time::Duration::from_secs(120);
-        loop {
-            attempts += 1;
-            if attempts > max_attempts {
-                return Err(anyhow::anyhow!("ModelPool exhausted"));
-            }
-        let hint_str = self.model_hint.read().ok().and_then(|g| g.clone());
-        let model_type_filter = hint_str.as_ref().and_then(|h| {
-            // Parse first type from comma-separated hint (e.g., "fast,free" → Free)
-            h.split(',')
-                .filter_map(|s| s.trim().parse::<agentic_loop_types::ModelType>().ok())
-                .find(|_| true)
-        });
-        let idx = self.pick_model(model_type_filter.as_ref()).await?;
+        let per_model_timeout = Duration::from_secs(120);
+
+        for attempt in 1..=max_attempts {
+            let hint_str = self.model_hint.read().ok().and_then(|g| g.clone());
+            let model_type_filter = hint_str.as_ref().and_then(|h| {
+                h.split(',')
+                    .filter_map(|s| s.trim().parse::<agentic_loop_types::ModelType>().ok())
+                    .find(|_| true)
+            });
+            let idx = self.pick_model(model_type_filter.as_ref()).await?;
             let entry = &self.entries[idx];
-            info!("ModelPool executing on {}/{}", entry.provider, entry.model);
+            info!("ModelPool executing on {}/{}", entry.provider_name, entry.model);
+
             let messages = vec![ChatMessage::system(system_prompt), ChatMessage::user(user_prompt)];
-            let request = ChatCompletionRequest { model: entry.model.clone(), messages, max_tokens: Some(max_tokens), ..Default::default() };
-            let result = if !tools.is_empty() {
-                let functions: Vec<FunctionDefinition> = tools.iter().map(|t| FunctionDefinition { name: t.name.clone(), description: Some(t.description.clone()), parameters: Some(t.parameters.clone()) }).collect();
-                let provider = entry.wrapper.get_provider(&entry.provider).ok_or_else(|| anyhow::anyhow!("Provider not found"))?;
-                tokio::time::timeout(per_model_timeout, provider.chat_completion_with_functions(request, functions)).await.map_err(|_| { vincents_llm::LLMError::TimeoutError { timeout_secs: per_model_timeout.as_secs(), message: Some(format!("Model {} timed out", entry.model)) } })?
-            } else {
-                let ctx = vincents_llm_wrapper::UserContext { user_id: "agentic-loop".into(), organization_id: None, billing_tier: vincents_llm_wrapper::BillingTier::Development, session_id: None };
-                tokio::time::timeout(per_model_timeout, entry.wrapper.chat_completion(&entry.provider, request, ctx)).await.map_err(|_| { vincents_llm::LLMError::TimeoutError { timeout_secs: per_model_timeout.as_secs(), message: Some(format!("Model {} timed out", entry.model)) } })?.map(|r| r.response)
+            let request = ChatCompletionRequest {
+                model: entry.model.clone(),
+                messages,
+                max_tokens: Some(max_tokens),
+                ..Default::default()
             };
-            match result {
+
+            match execute_with_entry(entry, request, tools, per_model_timeout).await {
                 Ok(response) => {
                     self.mark_success(idx).await;
-                    let tokens = response.usage.as_ref().map(|u| u.total_tokens).unwrap_or(0);
-                    let choice = response.choices.into_iter().next();
-                    let (text, finish, tool_calls) = match choice {
-                        Some(c) => {
-                            let txt = match &c.message { ChatMessage::Assistant { content, .. } => content.clone(), _ => None };
-                            let calls: Vec<_> = match &c.message { ChatMessage::Assistant { tool_calls: Some(tc), .. } => tc.iter().filter_map(|tc| match tc { vincents_llm::ToolCall::Function(vincents_llm::FunctionCall::Custom(cc)) => Some(crate::executor::ToolCallRequest { id: cc.id.clone().unwrap_or_default(), name: cc.name.clone(), arguments: serde_json::from_str(&cc.arguments).unwrap_or(serde_json::Value::Null) }), _ => None }).collect(), _ => vec![] };
-                            (txt, c.finish_reason.clone(), calls)
-                        }
-                        None => (None, None, vec![]),
-                    };
-                    return Ok(LlmStepResult { text, tool_calls, tokens_used: tokens, estimated_cost: 0.0, finish_reason: finish, session_id: String::new() });
+                    return Ok(parse_pool_response(response));
                 }
                 Err(llm_err) => {
-                    warn!("ModelPool {}/{} failed: {}", entry.provider, entry.model, llm_err);
+                    warn!("ModelPool {}/{} failed: {}", entry.provider_name, entry.model, llm_err);
                     let escalated = self.mark_failure(idx, &llm_err).await;
-                    if escalated { info!("Provider {} escalated", entry.provider); }
+                    if escalated { info!("Provider {} escalated", entry.provider_name); }
                     if !llm_err.is_retryable() { return Err(anyhow::anyhow!("{}", llm_err)); }
+                    let _ = attempt; // suppress unused warning
                 }
             }
         }
+
+        Err(anyhow::anyhow!("ModelPool exhausted"))
     }
 
     async fn execute_continuation(&self, messages: Vec<ChatMessage>, tools: &[ToolDefinition], max_tokens: u32) -> Result<LlmStepResult> {
         let idx = *self.current_index.read().await;
         let entry = &self.entries[idx];
-        let functions: Vec<FunctionDefinition> = tools.iter().map(|t| FunctionDefinition { name: t.name.clone(), description: Some(t.description.clone()), parameters: Some(t.parameters.clone()) }).collect();
-        let request = ChatCompletionRequest { model: entry.model.clone(), messages, max_tokens: Some(max_tokens), ..Default::default() };
-        let provider = entry.wrapper.get_provider(&entry.provider).ok_or_else(|| anyhow::anyhow!("Provider not found"))?;
-        let response = match tokio::time::timeout(std::time::Duration::from_secs(120), provider.chat_completion_with_functions(request, functions)).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(llm_err)) => {
-                self.mark_failure(idx, &llm_err).await;
-                return Err(anyhow::anyhow!("{}", llm_err));
-            }
-            Err(_) => {
-                let llm_err = vincents_llm::LLMError::TimeoutError { timeout_secs: 120, message: Some(format!("Model {} timed out", entry.model)) };
-                self.mark_failure(idx, &llm_err).await;
-                return Err(anyhow::anyhow!("{}", llm_err));
-            }
+        let request = ChatCompletionRequest {
+            model: entry.model.clone(),
+            messages,
+            max_tokens: Some(max_tokens),
+            ..Default::default()
         };
-        self.mark_success(idx).await;
-        let tokens = response.usage.as_ref().map(|u| u.total_tokens).unwrap_or(0);
-        let choice = response.choices.into_iter().next();
-        let (text, finish, tool_calls) = match choice {
-            Some(c) => {
-                let txt = match &c.message { ChatMessage::Assistant { content, .. } => content.clone(), _ => None };
-                let calls: Vec<_> = match &c.message { ChatMessage::Assistant { tool_calls: Some(tc), .. } => tc.iter().filter_map(|tc| match tc { vincents_llm::ToolCall::Function(vincents_llm::FunctionCall::Custom(cc)) => Some(crate::executor::ToolCallRequest { id: cc.id.clone().unwrap_or_default(), name: cc.name.clone(), arguments: serde_json::from_str(&cc.arguments).unwrap_or(serde_json::Value::Null) }), _ => None }).collect(), _ => vec![] };
-                (txt, c.finish_reason.clone(), calls)
+
+        match execute_with_entry(entry, request, tools, Duration::from_secs(120)).await {
+            Ok(response) => {
+                self.mark_success(idx).await;
+                Ok(parse_pool_response(response))
             }
-            None => (None, None, vec![]),
-        };
-        Ok(LlmStepResult { text, tool_calls, tokens_used: tokens, estimated_cost: 0.0, finish_reason: finish, session_id: String::new() })
+            Err(llm_err) => {
+                self.mark_failure(idx, &llm_err).await;
+                Err(anyhow::anyhow!("{}", llm_err))
+            }
+        }
     }
 
     async fn execute_with_tool_results(&self, system_prompt: &str, conversation_history: Vec<ChatMessage>, tool_results: Vec<ToolResult>, tools: &[ToolDefinition], max_tokens: u32) -> Result<LlmStepResult> {
@@ -510,7 +544,7 @@ impl LlmExecutorTrait for ModelPool {
     }
 
     fn current_model(&self) -> &str { &self.entries[*self.current_index.blocking_read()].model }
-    fn current_provider(&self) -> &str { &self.entries[*self.current_index.blocking_read()].provider }
+    fn current_provider(&self) -> &str { &self.entries[*self.current_index.blocking_read()].provider_name }
     fn recommended_model_type(&self) -> agentic_loop_types::ModelType {
         let idx = *self.current_index.blocking_read();
         let entry = &self.entries[idx];
@@ -551,9 +585,11 @@ struct ModelsResponse {
 }
 
 /// Discover free tool-calling models from OpenRouter.
-/// Returns model entries sorted by context length descending.
+///
+/// Takes a provider (already configured with OpenRouter credentials) and
+/// queries the public /models endpoint. Returns entries ready for pool creation.
 pub async fn discover_openrouter_models(
-    wrapper: Arc<LlmWrapper>,
+    provider: Arc<dyn LLMProvider>,
     min_context: u32,
 ) -> Result<Vec<PoolModelEntry>> {
     let client = reqwest::Client::new();
@@ -572,20 +608,17 @@ pub async fn discover_openrouter_models(
     let mut entries: Vec<PoolModelEntry> = models.data
         .into_iter()
         .filter(|m| {
-            // Must be free
             let is_free = m.pricing.as_ref()
                 .and_then(|p| p.prompt.as_ref())
                 .map(|p| p == "0")
                 .unwrap_or(false);
             if !is_free { return false; }
 
-            // Must support tools
             let has_tools = m.supported_parameters.as_ref()
                 .map(|params| params.iter().any(|p| p.to_lowercase() == "tools"))
                 .unwrap_or(false);
             if !has_tools { return false; }
 
-            // Must have sufficient context
             let ctx = m.context_length.unwrap_or(0) as u32;
             if ctx < min_context { return false; }
 
@@ -606,9 +639,9 @@ pub async fn discover_openrouter_models(
             }
 
             PoolModelEntry {
-                provider: "openrouter".to_string(),
+                provider_name: "openrouter".to_string(),
                 model: m.id.clone(),
-                wrapper: wrapper.clone(),
+                provider: provider.clone(),
                 context_length: ctx,
                 capabilities,
                 cost_tier: ModelCostTier::Free,
@@ -616,19 +649,17 @@ pub async fn discover_openrouter_models(
         })
         .collect();
 
-    // Sort by context length descending
     entries.sort_by(|a, b| b.context_length.cmp(&a.context_length));
-
     Ok(entries)
 }
 
 /// Create a ModelPool by discovering free models from OpenRouter.
 pub async fn create_free_pool(
-    wrapper: Arc<LlmWrapper>,
+    provider: Arc<dyn LLMProvider>,
     strategy: RotationStrategy,
     min_context: u32,
 ) -> Result<ModelPool> {
-    let entries = discover_openrouter_models(wrapper, min_context).await?;
+    let entries = discover_openrouter_models(provider, min_context).await?;
     if entries.is_empty() {
         return Err(anyhow::anyhow!("No free tool-calling models found on OpenRouter"));
     }

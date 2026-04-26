@@ -1,47 +1,37 @@
-//! Provider factory — maps ApiType + credentials to registered LlmWrapper.
+//! Provider factory — maps ApiType + credentials to `Arc<dyn LLMProvider>`.
 //!
-//! Given a resolved provider (name, api type, base_url, api_key), creates
-//! the appropriate provider via vincents-llm and registers it in a LlmWrapper.
+//! This is the **only file** that knows about concrete provider types.
+//! Everything else in the crate depends on the `LLMProvider` trait.
 
 use anyhow::{Context, Result};
 use std::sync::Arc;
-use vincents_llm::{OpenAIProvider, AnthropicProvider};
-use vincents_llm_wrapper::LlmWrapper;
+use vincents_llm::{LLMProvider, OpenAIProvider, AnthropicProvider};
 use tracing::instrument;
 
 use crate::provider_registry::ResolvedProvider;
 
-/// Create a fully configured LlmWrapper with the given provider registered.
+/// Create a fully configured provider from a resolved provider config.
 ///
-/// Returns the wrapper, ready for use with LlmExecutor.
-pub async fn create_wrapper(resolved: &ResolvedProvider) -> Result<Arc<LlmWrapper>> {
+/// Returns `Arc<dyn LLMProvider>`, ready for use with `LlmExecutor` or `ModelPool`.
+pub async fn create_provider(resolved: &ResolvedProvider) -> Result<Arc<dyn LLMProvider>> {
     let api_key = resolved
         .api_key
         .as_ref()
         .context(format!("No API key for provider '{}'", resolved.name))?;
 
-    let wrapper = LlmWrapper::new(None).await;
-
-    if resolved.api.is_openai_compatible() {
-        // OpenAI-compatible (includes ZAI, xai, groq, cerebras, openrouter, etc.)
+    let provider: Arc<dyn LLMProvider> = if resolved.api.is_openai_compatible() {
         let config = vincents_llm::openai::OpenAIConfig {
             api_key: api_key.clone(),
             base_url: Some(resolved.base_url.clone()),
             ..Default::default()
         };
-        let provider = OpenAIProvider::with_config(config)?;
-        wrapper.register_provider(resolved.name.clone(), provider).await;
+        Arc::new(OpenAIProvider::with_config(config)?)
     } else if resolved.api.is_anthropic_compatible() {
         if resolved.base_url != "https://api.anthropic.com" {
-            let provider = AnthropicProvider::with_endpoint(api_key.clone(), resolved.base_url.clone()).await?;
-            wrapper.register_provider(resolved.name.clone(), provider).await;
+            Arc::new(AnthropicProvider::with_endpoint(api_key.clone(), resolved.base_url.clone()).await?)
         } else {
-            wrapper.register_anthropic(resolved.name.clone(), api_key).await?;
+            Arc::new(AnthropicProvider::new(api_key.clone()).await?)
         }
-    } else if resolved.name == "openrouter" {
-        wrapper.register_openrouter(resolved.name.clone(), api_key).await?;
-    } else if resolved.name == "google" {
-        wrapper.register_gemini(resolved.name.clone(), api_key).await?;
     } else {
         // Default: try OpenAI-compatible (most APIs speak this format)
         tracing::warn!(
@@ -54,16 +44,15 @@ pub async fn create_wrapper(resolved: &ResolvedProvider) -> Result<Arc<LlmWrappe
             base_url: Some(resolved.base_url.clone()),
             ..Default::default()
         };
-        let provider = OpenAIProvider::with_config(config)?;
-        wrapper.register_provider(resolved.name.clone(), provider).await;
-    }
+        Arc::new(OpenAIProvider::with_config(config)?)
+    };
 
-    Ok(Arc::new(wrapper))
+    Ok(provider)
 }
 
 /// Resolve a provider by name from the registry.
 /// Returns the first matching available provider.
-    #[instrument(fields(provider = %provider_name))]
+#[instrument(fields(provider = %provider_name))]
 pub fn resolve_provider(provider_name: &str) -> Result<ResolvedProvider> {
     use crate::provider_registry::{resolve_available_providers, load_embedded_registry};
 
@@ -114,57 +103,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_wrapper_no_key() {
+    async fn test_create_provider_no_key() {
         let resolved = make_resolved("test", "openai-completions", "https://api.test.com/v1", None);
-        let result = create_wrapper(&resolved).await;
+        let result = create_provider(&resolved).await;
         assert!(result.is_err(), "Expected error for missing API key");
     }
 
     #[tokio::test]
-    async fn test_create_wrapper_openai_compat() {
+    async fn test_create_provider_openai_compat() {
         let resolved = make_resolved(
             "test-openai",
             "openai-completions",
             "https://api.test.com/v1",
             Some("test-key"),
         );
-        let wrapper = create_wrapper(&resolved).await.unwrap();
-        assert!(wrapper.provider_names().contains(&"test-openai".to_string()));
+        let provider = create_provider(&resolved).await.unwrap();
+        // Provider name is the canonical type name, not the resolved name
+        assert_eq!(provider.name(), "openai");
     }
 
     #[tokio::test]
-    async fn test_create_wrapper_zai() {
-        let resolved = make_resolved(
-            "zai",
-            "openai-completions",
-            "https://api.z.ai/api/coding/paas/v4",
-            Some("zai-test-key"),
-        );
-        let wrapper = create_wrapper(&resolved).await.unwrap();
-        assert!(wrapper.provider_names().contains(&"zai".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_create_wrapper_anthropic() {
-        let resolved = make_resolved(
-            "anthropic",
-            "anthropic-messages",
-            "https://api.anthropic.com",
-            Some("test-key"),
-        );
-        let wrapper = create_wrapper(&resolved).await.unwrap();
-        assert!(wrapper.provider_names().contains(&"anthropic".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_create_wrapper_fallback() {
+    async fn test_create_provider_custom_fallback() {
         let resolved = make_resolved(
             "custom",
             "custom-api",
             "https://custom.api.com/v1",
             Some("test-key"),
         );
-        let wrapper = create_wrapper(&resolved).await.unwrap();
-        assert!(wrapper.provider_names().contains(&"custom".to_string()));
+        let provider = create_provider(&resolved).await.unwrap();
+        // Falls back to OpenAI-compatible
+        assert_eq!(provider.name(), "openai");
     }
 }

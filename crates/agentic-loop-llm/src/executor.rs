@@ -1,23 +1,26 @@
-//! LLM executor — drives agent steps via vincents-llm-wrapper.
+//! LLM executor — drives agent steps via the `LLMProvider` trait.
 //!
 //! Each step:
-//! 1. Build ChatCompletionRequest with system + user prompts + tool definitions
-//! 2. Call LlmWrapper.chat_completion (with billing, quotas, session tracking)
+//! 1. Build `ChatCompletionRequest` with system + user prompts + tool definitions
+//! 2. Call `provider.chat_completion` (or `chat_completion_with_functions`)
 //! 3. Parse response for tool calls
 //! 4. Return structured result for the agent loop runner
+//!
+//! This crate depends **only** on the `LLMProvider` trait — no concrete
+//! wrapper types. The factory creates providers, the executor uses them.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use vincents_llm::{
     ChatCompletionRequest, ChatMessage, FunctionDefinition,
+    LLMProvider,
 };
-use vincents_llm_wrapper::LlmWrapper;
 use tracing::instrument;
 
 // ─── LlmExecutorTrait ─────────────────────────────────────────────────────
 
-/// Trait for LLM execution — implemented by both single LlmExecutor and ModelPool.
+/// Trait for LLM execution — implemented by both single `LlmExecutor` and `ModelPool`.
 ///
 /// The runner holds `Option<Arc<dyn LlmExecutorTrait>>` so it doesn't care
 /// whether it's talking to one model or a pool with fallback rotation.
@@ -57,13 +60,9 @@ pub trait LlmExecutorTrait: Send + Sync {
     fn current_provider(&self) -> &str;
 
     /// Get the recommended model type for the next execution.
-    /// This allows hierarchical agents to optimize cost by using
-    /// cheaper models for simple tasks.
     fn recommended_model_type(&self) -> agentic_loop_types::ModelType;
 
     /// Set a model type hint for the next pick_model call.
-    /// Pool implementations use this to filter candidates.
-    /// Single-model executors ignore this.
     fn set_model_hint(&self, hint: Option<String>);
 }
 
@@ -78,12 +77,10 @@ pub struct LlmStepResult {
     pub tool_calls: Vec<ToolCallRequest>,
     /// Token usage.
     pub tokens_used: u32,
-    /// Estimated cost.
+    /// Estimated cost (rough, from token counts × known pricing).
     pub estimated_cost: f64,
     /// Finish reason (e.g. "stop", "tool_calls").
     pub finish_reason: Option<String>,
-    /// The session ID from the wrapper.
-    pub session_id: String,
 }
 
 /// A tool call requested by the LLM.
@@ -97,23 +94,16 @@ pub struct ToolCallRequest {
     pub arguments: serde_json::Value,
 }
 
-/// Executes LLM steps via vincents-llm-wrapper.
+/// Executes LLM steps via any `LLMProvider` implementation.
 pub struct LlmExecutor {
-    wrapper: Arc<LlmWrapper>,
-    provider_name: String,
+    provider: Arc<dyn LLMProvider>,
     model: String,
-    user_id: String,
 }
 
 impl LlmExecutor {
-    /// Create a new executor.
-    pub fn new(
-        wrapper: Arc<LlmWrapper>,
-        provider_name: String,
-        model: String,
-        user_id: String,
-    ) -> Self {
-        Self { wrapper, provider_name, model, user_id }
+    /// Create a new executor from any `LLMProvider` trait object.
+    pub fn new(provider: Arc<dyn LLMProvider>, model: String) -> Self {
+        Self { provider, model }
     }
 
     /// Execute a single agent step: send prompts, get response.
@@ -129,46 +119,7 @@ impl LlmExecutor {
             ChatMessage::system(system_prompt),
             ChatMessage::user(user_prompt),
         ];
-
-        let request = ChatCompletionRequest {
-            model: self.model.clone(),
-            messages,
-            max_tokens: Some(max_tokens),
-            ..Default::default()
-        };
-
-        // Add tool definitions as functions if provided
-        if !tools.is_empty() {
-            let functions: Vec<FunctionDefinition> = tools.iter().map(|t| FunctionDefinition {
-                name: t.name.clone(),
-                description: Some(t.description.clone()),
-                parameters: Some(t.parameters.clone()),
-            }).collect();
-
-            // Use the chat_completion_with_functions path via the provider directly
-            // The wrapper doesn't expose function calling, so we go through the provider
-            let provider = self.wrapper.get_provider(&self.provider_name)
-                .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", self.provider_name))?;
-
-            let response = provider.chat_completion_with_functions(request, functions).await?;
-
-            return self.parse_response(response);
-        }
-
-        let context = vincents_llm_wrapper::UserContext {
-            user_id: self.user_id.clone(),
-            organization_id: None,
-            billing_tier: vincents_llm_wrapper::BillingTier::Development,
-            session_id: None,
-        };
-
-        let wrapped = self.wrapper.chat_completion(
-            &self.provider_name,
-            request,
-            context,
-        ).await?;
-
-        self.parse_wrapped_response(wrapped)
+        self.execute_messages(messages, tools, max_tokens).await
     }
 
     /// Execute a continuation with full conversation history (for tool dispatch loop).
@@ -179,24 +130,7 @@ impl LlmExecutor {
         tools: &[ToolDefinition],
         max_tokens: u32,
     ) -> Result<LlmStepResult> {
-        let functions: Vec<FunctionDefinition> = tools.iter().map(|t| FunctionDefinition {
-            name: t.name.clone(),
-            description: Some(t.description.clone()),
-            parameters: Some(t.parameters.clone()),
-        }).collect();
-
-        let request = ChatCompletionRequest {
-            model: self.model.clone(),
-            messages,
-            max_tokens: Some(max_tokens),
-            ..Default::default()
-        };
-
-        let provider = self.wrapper.get_provider(&self.provider_name)
-            .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", self.provider_name))?;
-
-        let response = provider.chat_completion_with_functions(request, functions).await?;
-        self.parse_response(response)
+        self.execute_messages(messages, tools, max_tokens).await
     }
 
     /// Execute a follow-up step with tool results.
@@ -212,7 +146,6 @@ impl LlmExecutor {
         let mut messages = vec![ChatMessage::system(system_prompt)];
         messages.extend(conversation_history);
 
-        // Add tool results as messages
         for result in tool_results {
             messages.push(ChatMessage::Tool {
                 tool_call_id: result.tool_call_id,
@@ -220,6 +153,16 @@ impl LlmExecutor {
             });
         }
 
+        self.execute_messages(messages, tools, max_tokens).await
+    }
+
+    /// Core execution — sends messages to the provider, parses response.
+    async fn execute_messages(
+        &self,
+        messages: Vec<ChatMessage>,
+        tools: &[ToolDefinition],
+        max_tokens: u32,
+    ) -> Result<LlmStepResult> {
         let request = ChatCompletionRequest {
             model: self.model.clone(),
             messages,
@@ -227,34 +170,18 @@ impl LlmExecutor {
             ..Default::default()
         };
 
-        if !tools.is_empty() {
+        let response = if !tools.is_empty() {
             let functions: Vec<FunctionDefinition> = tools.iter().map(|t| FunctionDefinition {
                 name: t.name.clone(),
                 description: Some(t.description.clone()),
                 parameters: Some(t.parameters.clone()),
             }).collect();
-
-            let provider = self.wrapper.get_provider(&self.provider_name)
-                .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", self.provider_name))?;
-
-            let response = provider.chat_completion_with_functions(request, functions).await?;
-            return self.parse_response(response);
-        }
-
-        let context = vincents_llm_wrapper::UserContext {
-            user_id: self.user_id.clone(),
-            organization_id: None,
-            billing_tier: vincents_llm_wrapper::BillingTier::Development,
-            session_id: None,
+            self.provider.chat_completion_with_functions(request, functions).await?
+        } else {
+            self.provider.chat_completion(request).await?
         };
 
-        let wrapped = self.wrapper.chat_completion(
-            &self.provider_name,
-            request,
-            context,
-        ).await?;
-
-        self.parse_wrapped_response(wrapped)
+        self.parse_response(response)
     }
 
     fn parse_response(
@@ -271,9 +198,7 @@ impl LlmExecutor {
                     _ => None,
                 };
                 let finish = c.finish_reason.clone();
-
-                // Extract function calls from assistant message
-                let calls = self.extract_tool_calls(&c.message);
+                let calls = Self::extract_tool_calls(&c.message);
                 (text, finish, calls)
             }
             None => (None, None, Vec::new()),
@@ -283,41 +208,27 @@ impl LlmExecutor {
             text,
             tool_calls,
             tokens_used,
-            estimated_cost: 0.0, // filled from wrapped response
+            estimated_cost: tokens_used as f64 * 0.000_01,
             finish_reason,
-            session_id: String::new(),
         })
     }
 
-    fn parse_wrapped_response(
-        &self,
-        wrapped: vincents_llm_wrapper::WrappedResponse,
-    ) -> Result<LlmStepResult> {
-        let mut result = self.parse_response(wrapped.response)?;
-        result.estimated_cost = wrapped.cost_estimate.total_cost;
-        result.session_id = wrapped.session_id;
-        Ok(result)
-    }
-
-    fn extract_tool_calls(&self, message: &ChatMessage) -> Vec<ToolCallRequest> {
+    pub fn extract_tool_calls(message: &ChatMessage) -> Vec<ToolCallRequest> {
         match message {
-            ChatMessage::Assistant { tool_calls, .. } => {
-                match tool_calls {
-                    Some(calls) => calls.iter().filter_map(|tc| {
-                        match tc {
-                            vincents_llm::ToolCall::Function(func) => match func {
-                                vincents_llm::FunctionCall::Custom(custom) => Some(ToolCallRequest {
-                                    id: custom.id.clone().unwrap_or_default(),
-                                    name: custom.name.clone(),
-                                    arguments: serde_json::from_str(&custom.arguments)
-                                        .unwrap_or(serde_json::Value::Null),
-                                }),
-                                _ => None,
-                            },
-                        }
-                    }).collect(),
-                    None => Vec::new(),
-                }
+            ChatMessage::Assistant { tool_calls: Some(calls), .. } => {
+                calls.iter().filter_map(|tc| {
+                    match tc {
+                        vincents_llm::ToolCall::Function(func) => match func {
+                            vincents_llm::FunctionCall::Custom(custom) => Some(ToolCallRequest {
+                                id: custom.id.clone().unwrap_or_default(),
+                                name: custom.name.clone(),
+                                arguments: serde_json::from_str(&custom.arguments)
+                                    .unwrap_or(serde_json::Value::Null),
+                            }),
+                            _ => None,
+                        },
+                    }
+                }).collect()
             }
             _ => Vec::new(),
         }
@@ -327,10 +238,10 @@ impl LlmExecutor {
     pub fn model(&self) -> &str { &self.model }
 
     /// Get the provider name.
-    pub fn provider(&self) -> &str { &self.provider_name }
+    pub fn provider_name(&self) -> &str { self.provider.name() }
 }
 
-/// Implement LlmExecutorTrait for LlmExecutor — delegates to inherent methods.
+/// Implement LlmExecutorTrait — delegates to inherent methods.
 #[async_trait::async_trait]
 impl LlmExecutorTrait for LlmExecutor {
     async fn execute_step(
@@ -365,22 +276,10 @@ impl LlmExecutorTrait for LlmExecutor {
         ).await
     }
 
-    fn current_model(&self) -> &str {
-        self.model()
-    }
-
-    fn current_provider(&self) -> &str {
-        self.provider()
-    }
-
-    fn recommended_model_type(&self) -> agentic_loop_types::ModelType {
-        // Default to Smart for single-model executor
-        agentic_loop_types::ModelType::Smart
-    }
-
-    fn set_model_hint(&self, _hint: Option<String>) {
-        // Single-model executor ignores model hints
-    }
+    fn current_model(&self) -> &str { self.model() }
+    fn current_provider(&self) -> &str { self.provider_name() }
+    fn recommended_model_type(&self) -> agentic_loop_types::ModelType { agentic_loop_types::ModelType::Smart }
+    fn set_model_hint(&self, _hint: Option<String>) { /* single-model ignores hints */ }
 }
 
 /// Implement AgentRunner trait for swappable execution.
@@ -398,18 +297,8 @@ impl crate::traits::AgentRunner for LlmExecutor {
             description: t.description.clone(),
             parameters: t.parameters.clone(),
         }).collect();
-        let result = self.execute_step(system_prompt, user_prompt, &tool_defs, max_tokens).await?;
-        Ok(crate::traits::AgentStepResult {
-            text: result.text,
-            tool_calls: result.tool_calls.into_iter().map(|tc| crate::traits::ToolCallDef {
-                id: tc.id,
-                name: tc.name,
-                arguments: tc.arguments,
-            }).collect(),
-            tokens_used: result.tokens_used,
-            estimated_cost: result.estimated_cost,
-            finish_reason: result.finish_reason,
-        })
+        let result = LlmExecutorTrait::execute_step(self, system_prompt, user_prompt, &tool_defs, max_tokens).await?;
+        Ok(result.into())
     }
 
     async fn continue_step(
@@ -456,21 +345,11 @@ impl crate::traits::AgentRunner for LlmExecutor {
         }).collect();
 
         let result = self.execute_continuation(messages, &tool_defs, max_tokens).await?;
-        Ok(crate::traits::AgentStepResult {
-            text: result.text,
-            tool_calls: result.tool_calls.into_iter().map(|tc| crate::traits::ToolCallDef {
-                id: tc.id,
-                name: tc.name,
-                arguments: tc.arguments,
-            }).collect(),
-            tokens_used: result.tokens_used,
-            estimated_cost: result.estimated_cost,
-            finish_reason: result.finish_reason,
-        })
+        Ok(result.into())
     }
 
     fn model_id(&self) -> &str { &self.model }
-    fn provider_name(&self) -> &str { &self.provider_name }
+    fn provider_name(&self) -> &str { self.provider.name() }
 }
 
 /// Implement CostEstimator for pre-execution cost estimates.
@@ -484,7 +363,6 @@ impl crate::traits::CostEstimator for LlmExecutor {
     ) -> crate::traits::CostEstimate {
         let input = (system_prompt_tokens + user_prompt_tokens) as f64;
         let output = expected_output_tokens as f64;
-        // Rough estimate — real pricing comes from provider registry
         let cost = input * 0.00001 + output * 0.00003;
         crate::traits::CostEstimate {
             input_tokens: system_prompt_tokens + user_prompt_tokens,
@@ -502,7 +380,7 @@ impl crate::traits::ModelInfoProvider for LlmExecutor {
     fn capabilities(&self) -> crate::traits::ModelCapabilities {
         crate::traits::ModelCapabilities {
             model_id: self.model.clone(),
-            provider: self.provider_name.clone(),
+            provider: self.provider.name().to_string(),
             context_window: 128_000,
             supports_tools: true,
             supports_streaming: true,
@@ -525,6 +403,23 @@ pub struct ToolDefinition {
 pub struct ToolResult {
     pub tool_call_id: String,
     pub content: String,
+}
+
+/// Convert LlmStepResult → AgentStepResult.
+impl From<LlmStepResult> for crate::traits::AgentStepResult {
+    fn from(r: LlmStepResult) -> Self {
+        Self {
+            text: r.text,
+            tool_calls: r.tool_calls.into_iter().map(|tc| crate::traits::ToolCallDef {
+                id: tc.id,
+                name: tc.name,
+                arguments: tc.arguments,
+            }).collect(),
+            tokens_used: r.tokens_used,
+            estimated_cost: r.estimated_cost,
+            finish_reason: r.finish_reason,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -575,7 +470,6 @@ mod tests {
             tokens_used: 150,
             estimated_cost: 0.002,
             finish_reason: Some("stop".into()),
-            session_id: "sess-1".into(),
         };
         let json = serde_json::to_string(&result).unwrap();
         let parsed: LlmStepResult = serde_json::from_str(&json).unwrap();

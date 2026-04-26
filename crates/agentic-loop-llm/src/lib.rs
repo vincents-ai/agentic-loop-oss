@@ -38,7 +38,7 @@ pub use orchestrator::{
     TaskOrchestrator, TaskOrchestratorTrait,
     execute_hierarchical,
 };
-pub use provider_factory::{create_wrapper, resolve_provider};
+pub use provider_factory::{create_provider, resolve_provider};
 pub use model_registry::{ModelRegistry, DiscoveredModel, ModelSource, DiscoveryStats};
 pub use provider_registry::{
     load_embedded_registry, resolve_available_providers, list_all_providers,
