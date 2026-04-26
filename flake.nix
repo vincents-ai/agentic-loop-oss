@@ -83,11 +83,6 @@
             git
           ];
 
-          ENGRAM_PATH = "/home/shift/code/agentic-git/engram";
-          VINCENTS_LLM_PATH = "/home/shift/code/vincents-ai/llm";
-          VINCENTS_LLM_WRAPPER_PATH = "/home/shift/code/vincents-ai/llm-wrapper";
-          AGENTIC_CORE_PLUGIN_PATH = "/home/shift/code/vincents-ai/skynet/plugins/agentic-core-plugin";
-
           RUST_LOG = "info";
         };
       }
