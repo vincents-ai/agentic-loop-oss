@@ -52,9 +52,9 @@ wasmtime = "44"
 wasmtime-wasi = "44"
 wit-bindgen = "0.42"
 
-# ── External path dependencies ──
-engram = { path = "/home/shift/code/agentic-git/engram" }
-vincents-llm = { path = "/home/shift/code/vincents-ai/llm" }
+# ── External git dependencies ──
+engram = { git = "https://github.com/vincents-ai/engram.git", branch = "feat/test-coverage-and-persona-improvements" }
+vincents-llm = { git = "https://github.com/vincents-ai/llm.git", branch = "main" }
 
 # ── Internal workspace crates ──
 agentic-loop-types = { path = "crates/agentic-loop-types" }

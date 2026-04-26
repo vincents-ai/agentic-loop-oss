@@ -1347,6 +1347,7 @@ dependencies = [
 [[package]]
 name = "engram"
 version = "0.6.3"
+source = "git+https://github.com/vincents-ai/engram.git?branch=feat%2Ftest-coverage-and-persona-improvements#fd954cd2334ebda7d72e7cd373e4ad91c57324d6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1386,6 +1387,7 @@ dependencies = [
 [[package]]
 name = "engram-core"
 version = "0.6.3"
+source = "git+https://github.com/vincents-ai/engram.git?branch=feat%2Ftest-coverage-and-persona-improvements#fd954cd2334ebda7d72e7cd373e4ad91c57324d6"
 dependencies = [
  "chrono",
  "git2",
@@ -1401,6 +1403,7 @@ dependencies = [
 [[package]]
 name = "engram-storage"
 version = "0.6.3"
+source = "git+https://github.com/vincents-ai/engram.git?branch=feat%2Ftest-coverage-and-persona-improvements#fd954cd2334ebda7d72e7cd373e4ad91c57324d6"
 dependencies = [
  "chrono",
  "engram-core",
@@ -1425,7 +1428,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3140,7 +3143,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3214,7 +3217,7 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4588,14 +4591,12 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-native-tls",
- "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "wasm-streams",
  "web-sys",
 ]
 
@@ -4609,6 +4610,7 @@ dependencies = [
  "bytes",
  "encoding_rs",
  "futures-core",
+ "futures-util",
  "h2",
  "http",
  "http-body",
@@ -4630,12 +4632,14 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams",
  "web-sys",
 ]
 
@@ -4684,7 +4688,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4741,7 +4745,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5286,7 +5290,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6013,6 +6017,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vincents-llm"
 version = "0.1.0"
+source = "git+https://github.com/vincents-ai/llm.git?branch=main#deae828bcdf4dd3c7cf7dae6288192326dfdd0f5"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -6020,7 +6025,7 @@ dependencies = [
  "chrono",
  "futures",
  "rand 0.8.6",
- "reqwest 0.12.28",
+ "reqwest 0.13.2",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -6207,9 +6212,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-streams"
-version = "0.4.2"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
+checksum = "9d1ec4f6517c9e11ae630e200b2b65d193279042e28edd4a2cda233e46670bbb"
 dependencies = [
  "futures-util",
  "js-sys",
